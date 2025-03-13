@@ -1,0 +1,1681 @@
+---
+title: "Classificació atès al motiu de desplaçament dels conductors ferits en accidents de trànsit a Barcelona (2023)"
+author: "Joan Manel Ramírez Jávega"
+date: '`r format(Sys.Date(),"%e Agost del %Y")`'
+output:
+  html_document:
+    highlight: default
+    number_sections: yes
+    theme: cosmo
+    toc: yes
+    toc_depth: 2
+  pdf_document:
+    toc: yes
+toc-title: "ÍNDEX"
+lang: catalan
+header-includes: |
+    \usepackage{fancyhdr}
+    \pagestyle{fancy}
+    \fancyhead[R]{Joan Manel Ramírez Jávega}
+    \fancyhead[L]{Barcelona (2024)}
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Introducció i presentació de les dades
+
+Donant continuïtat al treball ja realitzat en el marc de l'assignatura
+*Mineria de dades*, cursada durant el segon semestre del curs 2023-2024
+del Màster de Ciència de Dades (Universitat Oberta de Catalunya) i
+podent-se consultar tant la [primera
+part](https://rpubs.com/ramirezjm/1210633) com la [segona
+part](https://rpubs.com/ramirezjm/1210635) en el repositori *RPubs*, ens
+proposem millorar-ne la modelització ja realitzada i escollir el model
+més addient per realitzar la imputació en la variable depenent
+"Es_mon_treball". Finalment, també prepararem les dades de tal manera
+que es puguin representar també en una capa del programari *QGIS* tot
+agregant-hi les seves respectives geocoordenades. Atès que part de les
+tasques ja s'han presentat i comentat en les dues parts anteriors,
+evitarem repetir aquelles seccions amb codi que ja s'han detallat en els
+dos articles anteriorment referits.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(warn=-1)
+```
+
+```{r load_libraries, include=FALSE}
+library(knitr)
+library(base)
+library(utils)
+library(dplyr)
+library(tidyr)
+library(plyr)
+library(stringr)
+library(stringi)
+library(data.table)
+library(ggplot2)
+library(gridExtra)
+library(glue)
+library(readr)
+library(arules)
+library(factoextra)
+library(splitstackshape)
+library(fields)
+library(stats)
+library(ggpubr)
+library(C50)
+library(DescTools)
+library(gmodels)
+library(randomForest)
+library(caret)
+# library(cluster)
+if (!require('tree')) install.packages('tree'); library('tree')
+if (!require('fpc')) install.packages('fpc'); library('fpc')
+library(questionr)
+library(lsr)
+library(interactions)
+library(xgboost)
+library(tidymodels)
+library(finetune)
+
+```
+
+```{r, include=FALSE, warning=FALSE}
+filenameAccidents <- "https://opendata-ajuntament.barcelona.cat/data/dataset/e769eb9d-d778-4cd7-9e3a-5858bba49b20/resource/d12c8a6f-feb0-4c3e-bcf1-46b8a8b3d651/download/2023_accidents_gu_bcn.csv"
+
+encoding <- guess_encoding(filenameAccidents, n_max = 1000)
+
+dadesAccidents <- read.csv(filenameAccidents, sep=",", header=TRUE,
+                    fileEncoding=paste(encoding[1,1]))
+
+maskDuplicats <- duplicated(dadesAccidents$Numero_expedient)
+
+dadesAccidents <- dadesAccidents[!maskDuplicats, ]
+
+maskPlusZeroVictimes <- dadesAccidents$Numero_victimes > 0
+dadesAccidents_clean <- dadesAccidents[maskPlusZeroVictimes, ]
+
+colsAccidents <- c("Numero_expedient", "Codi_districte", "Nom_districte", "Codi_barri", "Nom_barri",
+                   "Codi_carrer", "Nom_carrer", "Num_postal.", "Descripcio_dia_setmana", "NK_Any", "Mes_any",
+                   "Nom_mes", "Dia_mes", "Hora_dia", "Descripcio_torn", "Numero_morts",
+                   "Numero_lesionats_lleus", "Numero_lesionats_greus", "Numero_victimes",
+                   "Numero_vehicles_implicats")
+
+dadesAccidents_clean <- dadesAccidents_clean[colsAccidents]
+
+# Persones involucrades:
+
+filenamePersones <- "https://opendata-ajuntament.barcelona.cat/data/dataset/87aa433e-fef8-4ff4-8f9a-d66e9beefff6/resource/00ff4482-841d-4dcf-8f2d-59237b2ec517/download/2023_accidents_persones_gu_bcn.csv"
+
+encoding <- guess_encoding(filenamePersones, n_max = 1000)
+
+dadesPersones <- read.csv(filenamePersones, sep=",", header=TRUE,
+                    fileEncoding=paste(encoding[1,1]))
+
+maskPersonesError <- grepl("[0-9].[0-9]", dadesPersones$Descripcio_victimitzacio)
+dadesPersonesError <- dadesPersones[maskPersonesError, ]
+dadesPersones <- dadesPersones[maskPersonesError==FALSE, ]
+
+maskConductor <- dadesPersones$Descripció_tipus_persona == "Conductor"
+dadesConductors <- dadesPersones[maskConductor, ]
+
+maskEsDesconegut <- dadesConductors$Descripcio_Motiu_desplacament_conductor == "Es desconeix"
+esMotiuDesconegut <- dadesConductors[maskEsDesconegut, ]
+nMotiuDesconegut <- nrow(esMotiuDesconegut)
+dadesConductors_clean <- dadesConductors[!maskEsDesconegut, ]
+
+maskDesconegutEdat <- dadesConductors_clean$Edat == "Desconegut"
+dadesPersonesEdatConeguda <- dadesPersones[maskDesconegutEdat == FALSE, ]
+dadesPersonesEdatConeguda$Edat <- as.integer(dadesPersonesEdatConeguda$Edat)
+
+dadesConductors_clean["Tipus_vehicle_estandaritzat"] <- "Vehicles sense permís de conducció"
+
+vehiclesUsProfessional <- c("Camió rígid <= 3,5 tones", "Camió rígid > 3,5 tones", "Tren o tramvia",
+                 "Tractor camió", "Maquinària d'obres i serveis", "Ambulància", 
+                 "Autobús articulat", "Autobús", "Taxi")
+maskVUP <- dadesConductors_clean$Desc_Tipus_vehicle_implicat %in% vehiclesUsProfessional
+dadesConductors_clean$Tipus_vehicle_estandaritzat[maskVUP] = "Vehicles d'Ús Professional"
+
+vehiclesM4R <- c("Furgoneta", "Turisme", "Quadricicle < 75 cc",
+                              "Quadricicle > 75 cc", "Tot terreny")
+maskVM4R <- dadesConductors_clean$Desc_Tipus_vehicle_implicat %in% vehiclesM4R
+dadesConductors_clean$Tipus_vehicle_estandaritzat[maskVM4R] = "Vehicles motoritzats de quatre rodes"
+
+vehiclesM2R <- c("Motocicleta", "Ciclomotor")
+maskVM2R <- dadesConductors_clean$Desc_Tipus_vehicle_implicat %in% vehiclesM2R
+dadesConductors_clean$Tipus_vehicle_estandaritzat[maskVM2R] <- "Vehicles motoritzats de 2 rodes"
+
+dadesConductors_clean["Victimitzacio_est"] <- ""
+
+dadesConductors_clean["Victimitzacio_est"]<- sapply(strsplit(dadesConductors_clean$Descripcio_victimitzacio,
+                                ":"), "[", 1)
+maskMorts <- grepl("Mort", dadesConductors_clean$Descripcio_victimitzacio)
+dadesConductors_clean$Victimitzacio_est[maskMorts] <- "Mort"
+
+colsConductors <- c("Numero_expedient", "Descripcio_sexe", "Edat",
+                    "Descripció_tipus_persona", "Descripcio_Lloc_atropellament_vianant",
+                    "Descripcio_Motiu_desplacament_conductor", "Desc_Tipus_vehicle_implicat",
+                    "Tipus_vehicle_estandaritzat", "Descripcio_victimitzacio", "Victimitzacio_est")
+
+dadesConductors_clean <- dadesConductors_clean[colsConductors]
+
+# Dades maniobra:
+
+filenameManiobra <- "https://opendata-ajuntament.barcelona.cat/data/dataset/29d1b774-a83e-4c1e-91f7-1b9ad042ea83/resource/5a040155-38b3-4b19-a4b0-c84a0618d363/download/2023_accidents_causa_conductor_gu_bcn_.csv"
+
+encoding <- guess_encoding(filenameManiobra, n_max = 1000)
+
+dadesManiobra <- read.csv(filenameManiobra, sep=",", header=TRUE,
+                    fileEncoding=paste(encoding[1,1]))
+
+maskDuplicatsManiobra <- duplicated(dadesManiobra$Numero_expedient)
+
+causesNoValor <- c("No determinada", "Desconegut", "Altres")
+maskCausesNoValor <- dadesManiobra$Descripcio_causa_mediata %in% causesNoValor
+dadesManiobra_clean <- dadesManiobra[!maskCausesNoValor, ]
+
+maskDuplicatsManiobra <- duplicated(dadesManiobra_clean$Numero_expedient)
+dadesManiobra_clean <- dadesManiobra_clean[!maskDuplicatsManiobra, ]
+
+colsManiobra <- c("Numero_expedient", "Descripcio_causa_mediata")
+
+dadesManiobra_clean <- dadesManiobra_clean[colsManiobra]
+
+
+# Subdataset dels vehicles implicats:
+
+filenameVehicles <- "https://opendata-ajuntament.barcelona.cat/data/dataset/317e3743-fb79-4d2f-a128-5f12d2c9a55a/resource/e7f52bf9-30a7-41d3-a15d-cac3f2da7025/download/2023_accidents_vehicles_gu_bcn.csv"
+
+encoding <- guess_encoding(filenameVehicles, n_max = 1000)
+
+dadesVehicles <- read.csv(filenameVehicles, sep=",", header=TRUE,
+                    fileEncoding=paste(encoding[1,1]))
+
+maskVehiclesErrors <- dadesVehicles$Numero_expedient == ""
+dadesVehicles <- dadesVehicles[!maskVehiclesErrors, ]
+
+maskDesconegut <- dadesVehicles$Antiguitat_carnet == "Desconegut"
+dadesVehicles <- dadesVehicles[maskDesconegut == FALSE, ]
+dadesVehicles$Antiguitat_carnet <- as.integer(dadesVehicles$Antiguitat_carnet)
+
+aggAntiguitat <- aggregate(dadesVehicles$Antiguitat_carnet,
+                       by=dadesVehicles["Numero_expedient"], FUN=min)
+aggAntiguitat <- drop_na(aggAntiguitat)
+
+colnames(aggAntiguitat) <- c("Numero_expedient", "Antiguitat_carnet_min")
+
+dadesVehicles["Tipus_vehicle_estandaritzat"] <- "Vehicles sense permís de conducció implicats"
+
+vehiclesUsProfessional <- c("Camió rígid <= 3,5 tones", "Camió rígid > 3,5 tones", "Tren o tramvia",
+                 "Tractor camió", "Maquinària d'obres i serveis", "Ambulància", 
+                 "Autobús articulat", "Autobús", "Taxi")
+maskVUP <- dadesConductors_clean$Desc_Tipus_vehicle_implicat %in% vehiclesUsProfessional
+dadesConductors_clean$Tipus_vehicle_estandaritzat[maskVUP] = "Vehicles d'Ús Professional"
+
+vehiclesM4R <- c("Furgoneta", "Turisme", "Quadricicle < 75 cc",
+                              "Quadricicle > 75 cc", "Tot terreny")
+maskVM4R <- dadesConductors_clean$Desc_Tipus_vehicle_implicat %in% vehiclesM4R
+dadesConductors_clean$Tipus_vehicle_estandaritzat[maskVM4R] = "Vehicles motoritzats de quatre rodes"
+
+vehiclesM2R <- c("Motocicleta", "Ciclomotor")
+maskVM2R <- dadesConductors_clean$Desc_Tipus_vehicle_implicat %in% vehiclesM2R
+dadesConductors_clean$Tipus_vehicle_estandaritzat[maskVM2R] <- "Vehicles motoritzats de 2 rodes"
+
+dadesVehicles$Tipus_vehicle_estandaritzat[maskVUP] = "Vehicles d'Ús Professional implicats"
+
+dadesVehicles$Tipus_vehicle_estandaritzat[maskVM4R] = "Vehicles motoritzats de quatre rodes implicats"
+
+dadesVehicles$Tipus_vehicle_estandaritzat[maskVM2R] <- "Vehicles motoritzats de 2 rodes implicats"
+
+# print(colnames(dadesVehicles))
+
+xx__ <- dadesVehicles %>% dplyr::count(Numero_expedient, Tipus_vehicle_estandaritzat)
+groupbyTipusVehicle_ <- pivot_wider(xx__, names_from = c('Tipus_vehicle_estandaritzat'), values_from = 'n')
+groupbyTipusVehicle_ <- groupbyTipusVehicle_ %>%
+    mutate(across(everything(), replace_na, 0))
+
+
+# Creació del dataset final:
+
+dades <- merge(x=dadesConductors_clean, y=dadesAccidents_clean, by="Numero_expedient")
+dades <- merge(x=dades, y=dadesManiobra_clean, by="Numero_expedient")
+dades <- merge(x=dades, y=aggAntiguitat, by="Numero_expedient")
+dades <- merge(x=dades, y=groupbyTipusVehicle_, by="Numero_expedient")
+
+festius <- data.frame(dia = c(6, 7, 10, 1, 13, 11, 12, 1, 6, 8, 25, 26),
+                      mes = c(1, 4, 4, 5, 8, 9, 10, 11, 12, 12, 12, 12))
+
+capsDeSetmana <- c("Dissabte", "Diumenge")
+
+dades["Es_laborable"] <- "Si"
+
+for (i in seq(1, nrow(festius), 1)){
+  data <- festius[i, ]
+  mask <- dades$Mes_any == data$mes & dades$Dia_mes == data$dia
+  dades$Es_laborable[mask] <- "No"
+  
+}
+
+for (i in seq(1, length(capsDeSetmana), 1)){
+  data <- capsDeSetmana[i]
+  mask <- dades$Descripcio_dia_setmana == data
+  dades$Es_laborable[mask] <- "No"
+  
+}
+
+
+dades["Es_mon_treball"] <- "Si"
+
+motiusNoMonTreball <- c("Altres activitats", "Oci i entreteniment",
+                        "Anada/tornada de ponts, festius, vacances",
+                        "Estudiant cap a centre d'estudis", "En pràctiques d'autoescola",
+                        "Activitat esportiva particular")
+maskMotiusNoMonTreball <- dades$Descripcio_Motiu_desplacament_conductor %in% motiusNoMonTreball
+dades$Es_mon_treball[maskMotiusNoMonTreball] <- "No"
+
+dades["Es_atropellament"] <- "No"
+unique(dades$Descripcio_Lloc_atropellament_vianant)
+
+maskLlocDesconegut <- grepl("Desconegut", dades$Descripcio_Lloc_atropellament_vianant)
+dades$Es_atropellament[!maskLlocDesconegut] <- "Si"
+
+dades$Edat <- as.numeric(dades$Edat)
+
+iqr <- summary(dades$Edat)
+
+cat("Rang interquartils:\n1r quartil: ", iqr[2], "\nMediana: ", iqr[3], "\n3r quartil: ", iqr[5])
+
+dades["Edat_CODIF"] <- "Conductors majors de 49 anys edat"
+
+dades$Edat_CODIF[dades$Edat <= iqr[2]] <- "Conductors fins 29 anys edat"
+dades$Edat_CODIF[dades$Edat > iqr[2] & dades$Edat <= iqr[3]] <- "Conductors entre 30 i 37 anys edat"
+dades$Edat_CODIF[dades$Edat > iqr[3] & dades$Edat <= iqr[5]] <- "Conductors d'entre 38 i 49 anys edat"
+
+dades["Interve_conductor_novell"] <- "No"
+dades$Interve_conductor_novell[dades$Antiguitat_carnet_min < 5] <- "Si"
+
+vars <- cols <-  data.frame(b = c("Numero_lesionats_lleus", "Numero_lesionats_greus",
+                                   "Numero_morts", "Numero_victimes", 
+                                  "Numero_vehicles_implicats"),
+                    names = c("Conductors en accidents amb un o més lesionats lleus",
+                              "Conductors en accidents amb un o més lesionats greus",
+                              "Conductors en accidents amb un o més morts",
+                              "Conductors en accidents amb una o més víctimes",
+                              "Conductors en accidents amb més d'un vehicle implicat"),
+                    type = c("lesionats lleus", "lesionats greus", "morts", 
+                             "víctimes de tots els tipus", "vehicles"),
+                    mask = c(0, 0, 0, 1, 1),
+                    new_vars = c("Lleus_CODIF", "Greus_CODIF", "Morts_CODIF", "Victimes_CODIF",
+                                 "Vehicles_CODIF"))
+
+dades["Lleus_CODIF"] <- "No"
+dades["Greus_CODIF"] <- "No"
+dades["Morts_CODIF"] <- "No"
+dades["Victimes_CODIF"] <- "No"
+dades["Vehicles_CODIF"] <- "No"
+
+for (i in seq(1, nrow(cols), 1)){
+  col <- vars[i, 1]
+  new_col <- vars[i, 5]
+  label <- vars[i, 2]
+  t <- vars[i, 3]
+  string <- glue("Fig. 21.{i}. Diagrama de barres apilades del recompte dels
+conductors en funció del nombre de {t} en l'accident.")
+  mask <- dades[col] > vars[i, 4]
+  dades[mask, new_col] <- "Si"
+}
+
+dades["VM2R_CODIF"] <- "No"
+dades["VM4R_CODIF"] <- "No"
+dades["V_no_permis_CODIF"] <- "No"
+dades["VUP_CODIF"] <- "No"
+
+varsVehicles <-  data.frame(b = c("Vehicles motoritzats de 2 rodes implicats",
+                                  "Vehicles motoritzats de quatre rodes implicats",
+                                  "Vehicles sense permís de conducció implicats",
+                                  "Vehicles d'Ús Professional implicats"),
+                    new_vars = c("VM2R_CODIF", "VM4R_CODIF", "V_no_permis_CODIF", "VUP_CODIF"))
+
+for (i in seq(1, nrow(varsVehicles), 1)){
+  col <- varsVehicles[i, 1]
+  new_col <- varsVehicles[i, 2]
+  label <- varsVehicles[i, 1]
+  t <- varsVehicles[i, 1]
+  string <- glue("Fig. 22.{i}. Diagrama de barres apilades del recompte
+dels conductors en funció del nombre de
+{label} en l'accident.")
+  mask <- dades[col] > 0
+  dades[mask, new_col] <- "Si"
+}
+
+
+```
+
+En aquest article realitzarem les tasques d'estandarització, neteja i
+codificació pel conjunt de dades corresponent a aquells conductors dels
+qui constava en l'expedient obert per la Guàrdia Urbana de Barcelona que
+el seu motiu de desplaçament com *Es desconeix*. Atès a que la
+naturalesa repetitiva d'aquest fragment amb el ja detallat en la
+[primera part](https://rpubs.com/ramirezjm/1210633), s'evitarà
+repetir-lo de nou.
+
+```{r, warning=FALSE, include=FALSE}
+maskEsDesconegut <- dadesConductors$Descripcio_Motiu_desplacament_conductor == "Es desconeix"
+dadesMotiuDesconegut <- dadesConductors[maskEsDesconegut, ]
+nMotiuDesconegut <- nrow(dadesMotiuDesconegut)
+
+maskDesconegutEdat <- dadesMotiuDesconegut$Edat == "Desconegut"
+dadesPersonesEdatConeguda <- dadesPersones[maskDesconegutEdat == FALSE, ]
+dadesPersonesEdatConeguda$Edat <- as.integer(dadesPersonesEdatConeguda$Edat)
+
+dadesMotiuDesconegut["Tipus_vehicle_estandaritzat"] <- "Vehicles sense permís de conducció"
+
+vehiclesUsProfessional <- c("Camió rígid <= 3,5 tones", "Camió rígid > 3,5 tones", "Tren o tramvia",
+                 "Tractor camió", "Maquinària d'obres i serveis", "Ambulància", 
+                 "Autobús articulat", "Autobús", "Taxi")
+maskVUP <- dadesMotiuDesconegut$Desc_Tipus_vehicle_implicat %in% vehiclesUsProfessional
+dadesMotiuDesconegut$Tipus_vehicle_estandaritzat[maskVUP] = "Vehicles d'Ús Professional"
+
+vehiclesM4R <- c("Furgoneta", "Turisme", "Quadricicle < 75 cc",
+                              "Quadricicle > 75 cc", "Tot terreny")
+maskVM4R <- dadesMotiuDesconegut$Desc_Tipus_vehicle_implicat %in% vehiclesM4R
+dadesMotiuDesconegut$Tipus_vehicle_estandaritzat[maskVM4R] = "Vehicles motoritzats de quatre rodes"
+
+vehiclesM2R <- c("Motocicleta", "Ciclomotor")
+maskVM2R <- dadesMotiuDesconegut$Desc_Tipus_vehicle_implicat %in% vehiclesM2R
+dadesMotiuDesconegut$Tipus_vehicle_estandaritzat[maskVM2R] <- "Vehicles motoritzats de 2 rodes"
+
+dadesMotiuDesconegut["Victimitzacio_est"] <- ""
+
+dadesMotiuDesconegut["Victimitzacio_est"]<- sapply(strsplit(dadesMotiuDesconegut$Descripcio_victimitzacio,
+                                ":"), "[", 1)
+maskMorts <- grepl("Mort", dadesMotiuDesconegut$Descripcio_victimitzacio)
+dadesMotiuDesconegut$Victimitzacio_est[maskMorts] <- "Mort"
+
+colsConductors <- c("Numero_expedient", "Descripcio_sexe", "Edat",
+                    "Descripció_tipus_persona", "Descripcio_Lloc_atropellament_vianant",
+                    "Descripcio_Motiu_desplacament_conductor", "Desc_Tipus_vehicle_implicat",
+                    "Tipus_vehicle_estandaritzat", "Descripcio_victimitzacio", "Victimitzacio_est")
+
+dadesMotiuDesconegut <- dadesMotiuDesconegut[colsConductors]
+
+# Creació del dataset final EsDesconegut:
+
+dadesDesconegut <- merge(x=dadesMotiuDesconegut, y=dadesAccidents_clean, by="Numero_expedient")
+dadesDesconegut <- merge(x=dadesDesconegut, y=dadesManiobra_clean, by="Numero_expedient")
+dadesDesconegut <- merge(x=dadesDesconegut, y=aggAntiguitat, by="Numero_expedient")
+dadesDesconegut <- merge(x=dadesDesconegut, y=groupbyTipusVehicle_, by="Numero_expedient")
+
+festius <- data.frame(dia = c(6, 7, 10, 1, 13, 11, 12, 1, 6, 8, 25, 26),
+                      mes = c(1, 4, 4, 5, 8, 9, 10, 11, 12, 12, 12, 12))
+
+capsDeSetmana <- c("Dissabte", "Diumenge")
+
+dadesDesconegut["Es_laborable"] <- "Si"
+
+for (i in seq(1, nrow(festius), 1)){
+  data <- festius[i, ]
+  mask <- dadesDesconegut$Mes_any == data$mes & dadesDesconegut$Dia_mes == data$dia
+  dadesDesconegut$Es_laborable[mask] <- "No"
+  
+}
+
+for (i in seq(1, length(capsDeSetmana), 1)){
+  data <- capsDeSetmana[i]
+  mask <- dadesDesconegut$Descripcio_dia_setmana == data
+  dadesDesconegut$Es_laborable[mask] <- "No"
+  
+}
+
+
+dadesDesconegut["Es_mon_treball"] <- "Si"
+
+motiusNoMonTreball <- c("Altres activitats", "Oci i entreteniment",
+                        "Anada/tornada de ponts, festius, vacances",
+                        "Estudiant cap a centre d'estudis", "En pràctiques d'autoescola",
+                        "Activitat esportiva particular")
+maskMotiusNoMonTreball <- dadesDesconegut$Descripcio_Motiu_desplacament_conductor %in% motiusNoMonTreball
+dadesDesconegut$Es_mon_treball[maskMotiusNoMonTreball] <- "No"
+
+dadesDesconegut["Es_atropellament"] <- "No"
+unique(dadesDesconegut$Descripcio_Lloc_atropellament_vianant)
+
+maskLlocDesconegut <- grepl("Desconegut", dadesDesconegut$Descripcio_Lloc_atropellament_vianant)
+dadesDesconegut$Es_atropellament[!maskLlocDesconegut] <- "Si"
+
+dadesDesconegut$Edat <- as.numeric(dadesDesconegut$Edat)
+
+iqr <- summary(dadesDesconegut$Edat)
+
+cat("Rang interquartils:\n1r quartil: ", iqr[2], "\nMediana: ", iqr[3], "\n3r quartil: ", iqr[5])
+
+dadesDesconegut["Edat_CODIF"] <- "Conductors majors de 49 anys edat"
+
+dadesDesconegut$Edat_CODIF[dadesDesconegut$Edat <= iqr[2]] <- "Conductors fins 29 anys edat"
+dadesDesconegut$Edat_CODIF[dadesDesconegut$Edat > iqr[2] & dadesDesconegut$Edat <= iqr[3]] <- "Conductors entre 30 i 37 anys edat"
+dadesDesconegut$Edat_CODIF[dadesDesconegut$Edat > iqr[3] & dadesDesconegut$Edat <= iqr[5]] <- "Conductors d'entre 38 i 49 anys edat"
+
+dadesDesconegut["Interve_conductor_novell"] <- "No"
+dadesDesconegut$Interve_conductor_novell[dadesDesconegut$Antiguitat_carnet_min < 5] <- "Si"
+
+vars <- cols <-  data.frame(b = c("Numero_lesionats_lleus", "Numero_lesionats_greus",
+                                   "Numero_morts", "Numero_victimes", 
+                                  "Numero_vehicles_implicats"),
+                    names = c("Conductors en accidents amb un o més lesionats lleus",
+                              "Conductors en accidents amb un o més lesionats greus",
+                              "Conductors en accidents amb un o més morts",
+                              "Conductors en accidents amb una o més víctimes",
+                              "Conductors en accidents amb més d'un vehicle implicat"),
+                    type = c("lesionats lleus", "lesionats greus", "morts", 
+                             "víctimes de tots els tipus", "vehicles"),
+                    mask = c(0, 0, 0, 1, 1),
+                    new_vars = c("Lleus_CODIF", "Greus_CODIF", "Morts_CODIF", "Victimes_CODIF",
+                                 "Vehicles_CODIF"))
+
+dadesDesconegut["Lleus_CODIF"] <- "No"
+dadesDesconegut["Greus_CODIF"] <- "No"
+dadesDesconegut["Morts_CODIF"] <- "No"
+dadesDesconegut["Victimes_CODIF"] <- "No"
+dadesDesconegut["Vehicles_CODIF"] <- "No"
+
+for (i in seq(1, nrow(cols), 1)){
+  col <- vars[i, 1]
+  new_col <- vars[i, 5]
+  label <- vars[i, 2]
+  t <- vars[i, 3]
+  string <- glue("Fig. 21.{i}. Diagrama de barres apilades del recompte dels
+conductors en funció del nombre de {t} en l'accident.")
+  mask <- dadesDesconegut[col] > vars[i, 4]
+  dadesDesconegut[mask, new_col] <- "Si"
+}
+
+dadesDesconegut["VM2R_CODIF"] <- "No"
+dadesDesconegut["VM4R_CODIF"] <- "No"
+dadesDesconegut["V_no_permis_CODIF"] <- "No"
+dadesDesconegut["VUP_CODIF"] <- "No"
+
+varsVehicles <-  data.frame(b = c("Vehicles motoritzats de 2 rodes implicats",
+                                  "Vehicles motoritzats de quatre rodes implicats",
+                                  "Vehicles sense permís de conducció implicats",
+                                  "Vehicles d'Ús Professional implicats"),
+                    new_vars = c("VM2R_CODIF", "VM4R_CODIF", "V_no_permis_CODIF", "VUP_CODIF"))
+
+for (i in seq(1, nrow(varsVehicles), 1)){
+  col <- varsVehicles[i, 1]
+  new_col <- varsVehicles[i, 2]
+  label <- varsVehicles[i, 1]
+  t <- varsVehicles[i, 1]
+  string <- glue("Fig. 22.{i}. Diagrama de barres apilades del recompte
+dels conductors en funció del nombre de
+{label} en l'accident.")
+  mask <- dadesDesconegut[col] > 0
+  dadesDesconegut[mask, new_col] <- "Si"
+}
+
+
+```
+
+```{r}
+maskDistDescon <- dades$Nom_districte == "Desconegut"
+dadesDistDescon <- dades[maskDistDescon, ]
+dades_ <- dades[!maskDistDescon, ]
+
+maskDistDescon <- dadesDesconegut$Nom_districte == "Desconegut"
+dadesDistDescon <- dadesDesconegut[maskDistDescon, ]
+dadesDesconegut_ <- dadesDesconegut[!maskDistDescon, ]
+
+nMotiuConegut <- nrow(dades_)
+nMotiuDesconegut <- nrow(dadesDesconegut_)
+nConductors <- nMotiuConegut + nMotiuDesconegut
+propMotiuConegut <- round((nMotiuConegut /nConductors) * 100, 3)
+propMotiuDesconegut <- round((nMotiuDesconegut /nConductors) * 100, 3)
+  
+print(glue("Es prenen en consideració {nConductors} conductors en total, dels qui {nMotiuConegut} ({propMotiuConegut} %) sí
+es coneix el motiu del seu desplaçament i d'altres {nMotiuDesconegut} ({propMotiuDesconegut} %) se'n
+desconeix el motiu del seu desplaçament."))
+
+```
+
+En canvi sí resulta rellevant observar que, a diferència de la tasca de
+codificació realitzada en la [segona
+part](https://rpubs.com/ramirezjm/1210635) de la variable
+"Es_ocupacional", que identifica si el moment que va tenir lloc
+l'accident era durant una franja horària amb un elevada proporció de
+desplaçament relacionats amb el món del treball o no en dies laborables,
+ara actualitzarem amb els resultats de l'*Enquesta de mobilitat en dia
+feiner 2023* corresponents a l'any 2023 que fan referència a les franjes
+horàries i el motiu del desplaçament (INSTITUT METRÒPOLI, 2023: 49), tot
+i que a partir d'aquesta evidència en contrast a les conclusions de
+l'estudi esmentat, trobem rellevant el nombre de desplaçaments
+relacionats amb el món del treball durant la franja des de les 5 fins
+les 16 hores - ambdues franges incloses-:
+
+```{r}
+dades_["Es_ocupacional"] <- "No"
+horaOcupacional <- c(5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+maskHorari <- dades_$Hora_dia %in% horaOcupacional
+maskLaborable <- dades_$Es_laborable == "Si"
+dades_$Es_ocupacional[maskHorari & maskLaborable] <- "Si"
+
+aggEs_ocupacional <- aggregate(dades_$Numero_expedient,
+                       by=dades_["Es_ocupacional"], FUN=length)
+
+ggplot(aggEs_ocupacional, aes(x="", y=x, fill=Es_ocupacional)) +
+  geom_bar(width = 1, stat = "identity", color = "black") +
+  ggtitle(glue("Fig. 1.1. Diagrama de barres apilades del recompte dels
+conductors en funció de si l'accident va tenir lloc durant
+horari ocupacional o no i també es coneix el motiu del
+desplaçament.")) + 
+  xlab(glue("Es_ocupacional")) + 
+  ylab("Nombre")
+
+nAccidents <- length(unique(dades_$Numero_expedient))
+nNo_Es_ocupacional <- aggEs_ocupacional[1, 2]
+propNo_Es_ocupacional <- round((nNo_Es_ocupacional / nMotiuConegut) * 100, 3)
+nSi_Es_ocupacional <- aggEs_ocupacional[2, 2]
+propSi_Es_ocupacional <- round((nSi_Es_ocupacional / nMotiuConegut) * 100, 3)
+
+print(glue("Del conjunt de conductors dels qui sí es coneix el motiu del seu desplaçament,
+{nSi_Es_ocupacional} ({propSi_Es_ocupacional} %) es desplaçaven durant horari ocupacional i altres {nNo_Es_ocupacional}
+({propNo_Es_ocupacional} %), comptant-se {nAccidents} accidents en total."))
+
+```
+
+```{r}
+dadesDesconegut_["Es_ocupacional"] <- "No"
+horaOcupacional <- c(5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+maskHorari <- dadesDesconegut_$Hora_dia %in% horaOcupacional
+maskLaborable <- dadesDesconegut_$Es_laborable == "Si"
+dadesDesconegut_$Es_ocupacional[maskHorari & maskLaborable] <- "Si"
+
+aggEs_ocupacional <- aggregate(dadesDesconegut_$Numero_expedient,
+                       by=dadesDesconegut_["Es_ocupacional"], FUN=length)
+
+ggplot(aggEs_ocupacional, aes(x="", y=x, fill=Es_ocupacional)) +
+  geom_bar(width = 1, stat = "identity", color = "black") +
+  ggtitle(glue("Fig. 1.2. Diagrama de barres apilades del recompte dels
+conductors en funció de si l'accident va tenir lloc durant
+horari ocupacional o no i no es coneix el motiu del
+desplaçament.")) + 
+  xlab(glue("Es_ocupacional")) + 
+  ylab("Nombre")
+
+nAccidents <- length(unique(dadesDesconegut_$Numero_expedient))
+nNo_Es_ocupacional <- aggEs_ocupacional[1, 2]
+propNo_Es_ocupacional <- round((nNo_Es_ocupacional / nMotiuDesconegut) * 100, 3)
+nSi_Es_ocupacional <- aggEs_ocupacional[2, 2]
+propSi_Es_ocupacional <- round((nSi_Es_ocupacional / nMotiuDesconegut) * 100, 3)
+
+print(glue("Del conjunt de conductors dels qui sí es coneix el motiu del seu desplaçament,
+{nSi_Es_ocupacional} ({propSi_Es_ocupacional} %) es desplaçaven durant horari ocupacional i altres {nNo_Es_ocupacional}
+({propNo_Es_ocupacional} %) no, comptant-se {nAccidents} accidents en total."))
+
+```
+
+Atès al resultat observable en les figures 1.1 i 1.2, es constata que la
+proporció de conductors ferits en accidents que van tenir lloc durant
+una franja horària ocupacional o no s'inverteix en el cas que es coneix
+o no també el motiu del seu desplaçament.
+
+També comprovem si té lloc algun canvi rellevant en el tamany de les
+classes en la variable de la descripció de victimització com mostra,
+atès que en les Figures 15.1 i 15.2 de la [primera
+part](https://rpubs.com/ramirezjm/1210633) ja en fem la comprovació que
+la distribució territorial no es veia fectada per la neteja de les
+dades:
+
+```{r}
+dades_["Victimitzacio_est_"] <- ""
+dades_$Victimitzacio_est_ <- sapply(strsplit(dades_$Descripcio_victimitzacio,
+                                ": "), "[", 2)
+maskMorts <- grepl("Mort", dades_$Descripcio_victimitzacio)
+dades_$Victimitzacio_est_[maskMorts] <- "Mort"
+dades_$Victimitzacio_est_ <- str_to_sentence(dades_$Victimitzacio_est_)
+
+aggVictmitzacio <- aggregate(dades_$Numero_expedient,
+                             by=dades_["Victimitzacio_est_"],
+                             FUN=length)
+
+ggplot(aggVictmitzacio, aes(x="", y=x, fill=Victimitzacio_est_)) +
+  geom_bar(width = 1, stat = "identity", color = "black") +
+  ggtitle(glue("Fig. 2.1. Diagrama de barres apilades del recompte dels
+conductors en funció del tipus de victimització i que sí es
+coneixia el motiu del desplaçament.")) + 
+  xlab(glue("Victimitzacio_est_")) + 
+  ylab("Nombre")
+
+```
+
+```{r}
+dadesDesconegut_["Victimitzacio_est_"] <- ""
+dadesDesconegut_$Victimitzacio_est_ <- sapply(strsplit(dadesDesconegut_$Descripcio_victimitzacio,
+                                ": "), "[", 2)
+maskMorts <- grepl("Mort", dadesDesconegut_$Descripcio_victimitzacio)
+dadesDesconegut_$Victimitzacio_est_[maskMorts] <- "Mort"
+dadesDesconegut_$Victimitzacio_est_ <- str_to_sentence(dadesDesconegut_$Victimitzacio_est_)
+
+aggVictmitzacio <- aggregate(dadesDesconegut_$Numero_expedient,
+                             by=dadesDesconegut_["Victimitzacio_est_"],
+                             FUN=length)
+
+ggplot(aggVictmitzacio, aes(x="", y=x, fill=Victimitzacio_est_)) +
+  geom_bar(width = 1, stat = "identity", color = "black") +
+  ggtitle(glue("Fig. 2.2. Diagrama de barres apilades del recompte dels
+conductors en funció del tipus de victimització i que sí es
+coneixia el motiu del desplaçament.")) + 
+  xlab(glue("Victimitzacio_est_")) + 
+  ylab("Nombre")
+
+```
+
+Tot apreciant-se al comparar les Figures 2.1 i 2.2 que la proporció dels
+grups és pràcticament idèntica tant el cas dels conductors que sí es
+coneixia el motiu del desplaçament com en el cas dels que es
+desconeixia.
+
+També procedim a codificar una nova variable a partir del mes en que es
+produí l'accident, tot classificant-los pels trimestres corresponents a
+les estacions de l'any: *Hivern*, *Primavera*, *Estiu* i *Tardor*.
+
+```{r}
+dades_['Estacio_any'] <- "Estiu"
+dades_$Estacio_any[dades_$Mes_any <= 3] <- "Hivern"
+dades_$Estacio_any[dades_$Mes_any > 3 & dades_$Mes_any <= 6] <- "Primavera"
+dades_$Estacio_any[dades_$Mes_any > 9] <- 'Tardor'
+
+aggEstacions <- aggregate(dades_$Numero_expedient,
+                             by=dades_["Estacio_any"],
+                             FUN=length)
+
+ggplot(aggEstacions, aes(x="", y=x, fill=Estacio_any)) +
+  geom_bar(width = 1, stat = "identity", color = "black") +
+  ggtitle(glue("Fig. 3.1. Diagrama de barres apilades del recompte dels
+conductors en funció de l'estació de l'any en la que es produí l'accident
+i que sí es coneixia el motiu del desplaçament.")) + 
+  xlab(glue("Estacio_any")) + 
+  ylab("Nombre")
+
+
+dades_$Tipus_vehicle_estandaritzat <- gsub("d'", "",
+                                          dades_$Tipus_vehicle_estandaritzat)
+dades_$Victimitzacio_est_ <- gsub("d'", "",
+                                  dades_$Victimitzacio_est_)
+
+dades_$Descripcio_causa_mediata <- gsub("d'", "",
+                                  dades_$Descripcio_causa_mediata)
+
+dades_$Nom_mes <- gsub("ç", "s", dades_$Nom_mes)
+
+dades_$Tipus_vehicle_estandaritzat <- 
+  stri_trans_general(str = dades_$Tipus_vehicle_estandaritzat,
+                   id = "Latin-ASCII")
+dades_$Victimitzacio_est_ <- 
+  stri_trans_general(str = dades_$Victimitzacio_est_,
+                   id = "Latin-ASCII")
+dades_$Descripcio_causa_mediata <- 
+  stri_trans_general(str = dades_$Descripcio_causa_mediata,
+                   id = "Latin-ASCII")
+dades_$Nom_districte <- 
+  stri_trans_general(str = dades_$Nom_districte,
+                   id = "Latin-ASCII")
+
+varsSup <- c("Descripcio_sexe", "Tipus_vehicle_estandaritzat",
+               "Victimitzacio_est_", "Nom_mes", "Nom_districte",
+             "Descripcio_causa_mediata", "Estacio_any",
+              "Victimes_CODIF", "Numero_morts",
+             "Numero_lesionats_lleus", "Numero_lesionats_greus",
+             "Numero_victimes", "Numero_vehicles_implicats",
+               "Vehicles_CODIF", "VM2R_CODIF", "VM4R_CODIF",
+             "V_no_permis_CODIF", "VUP_CODIF", "Interve_conductor_novell",
+             "Edat_CODIF", "Edat", "Es_laborable", "Es_ocupacional",
+             "Es_mon_treball")
+
+dadesSup <- dades_[varsSup]
+
+```
+
+```{r}
+dadesDesconegut_['Estacio_any'] <- "Estiu"
+dadesDesconegut_$Estacio_any[dadesDesconegut_$Mes_any <= 3] <- "Hivern"
+dadesDesconegut_$Estacio_any[dadesDesconegut_$Mes_any > 3 & dadesDesconegut_$Mes_any <= 6] <- "Primavera"
+dadesDesconegut_$Estacio_any[dadesDesconegut_$Mes_any > 9] <- 'Tardor'
+
+aggEstacions <- aggregate(dadesDesconegut_$Numero_expedient,
+                             by=dadesDesconegut_["Estacio_any"],
+                             FUN=length)
+
+ggplot(aggEstacions, aes(x="", y=x, fill=Estacio_any)) +
+  geom_bar(width = 1, stat = "identity", color = "black") +
+  ggtitle(glue("Fig. 3.2. Diagrama de barres apilades del recompte dels
+conductors en funció de l'estació de l'any en la que es produí l'accident
+i que no es coneixia el motiu del desplaçament.")) + 
+  xlab(glue("Estacio_any")) + 
+  ylab("Nombre")
+
+
+dadesDesconegut_$Tipus_vehicle_estandaritzat <- gsub("d'", "",
+                                          dadesDesconegut_$Tipus_vehicle_estandaritzat)
+dadesDesconegut_$Victimitzacio_est_ <- gsub("d'", "",
+                                  dadesDesconegut_$Victimitzacio_est_)
+
+dadesDesconegut_$Descripcio_causa_mediata <- gsub("d'", "",
+                                  dadesDesconegut_$Descripcio_causa_mediata)
+
+dadesDesconegut_$Nom_mes <- gsub("ç", "s", dadesDesconegut_$Nom_mes)
+
+dadesDesconegut_$Tipus_vehicle_estandaritzat <- 
+  stri_trans_general(str = dadesDesconegut_$Tipus_vehicle_estandaritzat,
+                   id = "Latin-ASCII")
+dadesDesconegut_$Victimitzacio_est_ <- 
+  stri_trans_general(str = dadesDesconegut_$Victimitzacio_est_,
+                   id = "Latin-ASCII")
+dadesDesconegut_$Descripcio_causa_mediata <- 
+  stri_trans_general(str = dadesDesconegut_$Descripcio_causa_mediata,
+                   id = "Latin-ASCII")
+dadesDesconegut_$Nom_districte <- 
+  stri_trans_general(str = dadesDesconegut_$Nom_districte,
+                   id = "Latin-ASCII")
+
+varsSup <- c("Descripcio_sexe", "Tipus_vehicle_estandaritzat",
+               "Victimitzacio_est_", "Nom_mes", "Nom_districte",
+             "Descripcio_causa_mediata", "Estacio_any",
+              "Victimes_CODIF", "Numero_morts",
+             "Numero_lesionats_lleus", "Numero_lesionats_greus",
+             "Numero_victimes", "Numero_vehicles_implicats",
+               "Vehicles_CODIF", "VM2R_CODIF", "VM4R_CODIF",
+             "V_no_permis_CODIF", "VUP_CODIF", "Interve_conductor_novell",
+             "Edat_CODIF", "Edat", "Es_laborable", "Es_ocupacional")
+
+dadesDesconegutSup <- dadesDesconegut_[varsSup]
+```
+
+Una vegada més, s'observa que entre ambdós subconjunts de dades no hi ha
+una diferència substancial en la distribució dels grups i sent en ambdós
+casos durant la primavera quan es comptabilitzen més conductors ferits,
+tot i que en el cas dels conductors dels que no es coneixia el motiu del
+seu desplaçament s'observa un lleu increment de la proporció per
+l'estació hivernal.
+
+# Modelització
+
+En les conclusions de la [segona
+part](https://rpubs.com/ramirezjm/1210635) d'aquesta sèrie vam constatar
+tot un seguit de mancances en les modelitzacions i la seva acpacitat
+d'encert, sent possiblement un dels motius el fet que hi havia un nombre
+molt elevat de variables en joc. Per aquest motiu en aquest apartat
+cercarem, en primer lloc, bastir un model de classificació amb
+l'algoritme de la Regressió Logística que ens permeti identificar quines
+de les variables del total de 23 variables utilitzables són
+estadísticament rellevants per identificar la variable dependent
+"Es_mon_treball". Posteriorment, a partir del resultat obtingut d'aquest
+primer algoritme, bastirem diversos models amb diversos tipus algoritmes
+com l'arbre de decisió sense poda o amb poda i amb diverses
+parametritzacions a més dels models del bosc aleatori i i el XGBoost.
+
+## Regressió logística
+
+De de la descomposició dels elements principlas realitzada en l'apartat
+5 de la [primera part](https://rpubs.com/ramirezjm/1210633) ja coneixem
+que les variables numèriques, amb l'excepció de "Numero_victimes" i
+"Numero_lesionats_greus", presenten una escassa correlació entre sí. En
+tot cas, cercarem introduir-les també en el model en la seva versió
+codificada excepte en el cas d'"Edat", que hi serà present en la versió
+contínua també. I a continuació procedim a realitzar l'anàlisi de les
+relacions entre variables amb la Regressió logística:
+
+```{r error=TRUE}
+dadesSup["EMT_recodificat"] <- ifelse(dadesSup$Es_mon_treball=="Si", 1, 0)
+
+cols_ <- colnames(dadesSup)
+df_dtype_ <- as.data.frame(sapply(dadesSup, class))
+
+for (col in cols_){
+  data_type <- paste(df_dtype_[col, 1])
+  n_domini <- length(unique(dadesSup[, col]))
+
+  if (data_type == "character"){
+    dadesSup[, col] <- as.factor(dadesSup[, col])
+  }
+  else if (n_domini <= 2) {
+    dadesSup[, col] <- as.factor(dadesSup[, col])
+  }
+}
+
+```
+
+```{r}
+cols_ <- colnames(dadesDesconegutSup)
+df_dtype_ <- as.data.frame(sapply(dadesDesconegutSup, class))
+
+for (col in cols_){
+  data_type <- paste(df_dtype_[col, 1])
+  n_domini <- length(unique(dadesDesconegutSup[, col]))
+
+  if (data_type == "character"){
+    dadesDesconegutSup[, col] <- as.factor(dadesDesconegutSup[, col])
+  }
+  else if (n_domini <= 2) {
+    dadesDesconegutSup[, col] <- as.factor(dadesDesconegutSup[, col])
+  }
+}
+
+```
+
+```{r}
+model <- glm(EMT_recodificat ~ Descripcio_sexe + Tipus_vehicle_estandaritzat +
+               Descripcio_causa_mediata + Estacio_any + Numero_morts +
+               Numero_lesionats_lleus + Numero_lesionats_greus + 
+               Numero_vehicles_implicats +
+               Victimitzacio_est_ + Nom_mes + Nom_districte + Victimes_CODIF +
+              Vehicles_CODIF + VM2R_CODIF + VM4R_CODIF + V_no_permis_CODIF +
+               VUP_CODIF + Interve_conductor_novell + Edat_CODIF +
+               Es_laborable + Es_ocupacional,
+                data=dadesSup, family=binomial(link=logit), na.action = NULL)
+
+summary(model)
+```
+
+Si establim que el llindar per acceptar la variable és 0.05 \> valor-p
+(*Pr(\>\|z\|)*) per considerar-les que tenen un valor explicatiu
+estadísticament rellevant, atès als resultats hauríem d'excloure totes
+les cinc variables numèriques i acceptar només nou de les variables que
+enumerem en aquesta taula:
+
+| Nom de la variable              | Descripció de la variable                                                                                                                                                                                                    |
+|---------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| "Tipu s_vehicle_es tandaritzat" | Estandarització en només quatre categories de la variable "Tipus_vehicle": "Vehicles d'ús professional", "Vehicles motoritzats de quatre rodes", "Vehicles motoritzats de dues rodes" i "Vehicles sense permís de conducció" |
+| "D escripcio_ca usa_mediata"    | Detalla la causa mediata identificada per la corresponent patrulla de la Guàrdia Urbana que fer l'atestat de l'accident, fent referència al tipus de maniobra o circumstància immediata que va causar l'accident.            |
+| " Estacio_any"                  | Trimestre de l'any en que va tenir lloc l'accident.                                                                                                                                                                          |
+| "Nom_mes"                       | Mes de l'any en que va tenir lloc l'accident.                                                                                                                                                                                |
+| "Vic times_CODIF"               | Estableix si va haver-hi dos o més víctimes en l'accident.                                                                                                                                                                   |
+| "Veh icles_CODIF"               | Estableix si va haver-hi dos o més vehicles implicats en l'accident.                                                                                                                                                         |
+| "Edat_CODIF"                    | Codificació de grups d'edat a partir dels valors interquartils: menors de 29 anys, més dels 29 fins els 37 anys, més dels 37 fins els 49 anys i majors de 49 anys.                                                           |
+| "E s_laborable"                 | Estableix si la data de l'accident era laborable durant l'any 2023.                                                                                                                                                          |
+| "Es\_ ocupacional"              | Estableix si l'hora de l'accident va ser dins d'una franja horària ocupacional, des de les 5 fins les 16h, en un dia laboral.                                                                                                |
+
+També comprovem quin grau d'encert o precisió té aquest model al
+comprovar amb les mateixes dades amb les que s'ha entrenat, mesurant
+també la seva sensitivitat - o grau per encertar que sí es desplaçava
+per un motiu relacionat amb el món del treball- i especificitat - o grau
+per encertar que no es desplaçava per un motiu relacionat amb el món del
+treball:
+
+```{r}
+pred <- predict(model, newdata=dadesSup, type='response')
+
+dadesSup$prediction <- ifelse(pred < 0.5 ,0, 1)
+prediccio <- as.factor(dadesSup$prediction)
+valor_esperat <- dadesSup$EMT_recodificat
+
+tb <- table(valor_esperat, prediccio); tb
+
+# TN: tb[1]
+# FP: tb[2]
+# FN: tb[3]
+# TP: tb[4]
+
+# accuracy
+precisio <- (tb[4] + tb[1]) / (tb[1] + tb[2] + tb[3] + tb[4])
+print(glue("\n\nLa precisió de la predicció és {round(precisio, 4)}."))
+
+# sensitivity
+sensitivitat <- tb[4] / (tb[4] + tb[3])
+print(glue("\n\nLa sensitivitat de la predicció és {round(sensitivitat, 4)}."))
+
+# specifity
+especificitat <- tb[1] / (tb[1] + tb[2])
+print(glue("\n\nLa especificitat de la predicció és {round(especificitat, 4)}."))
+
+
+```
+
+Observem que té una moderada capacitat predictiva tot i que
+l'especificitat és força superior a la seva sensitivitat, tret que
+acostuma ser un indicador de sobreajust del model. Per aquest motiu com
+també pel fet que l'objectiu d'emprar aquest algoritme de regressió
+logística era poder escollir, a partir de la seva significància
+estadística, quines variables tenen potencialment capacitat predictora
+i, per tant, no s'ha testejat amb una part de les dades que no hagi
+format part del model, el descartarem.
+
+Per altra banda, també observem que dues de les variables - "Nom_mes" i
+"Estacio_any"- deriva l'una de l'altra però codificada de manera
+diferent, millorant apreciablement la capacitat predictiva dels modes de
+classificació que presentarem tot seguit en el cas de l'algorisme
+*XGBoost*; en canvi, s'observa que no és el cas pels models d'Arbre de
+decisió.
+
+## XGBoost (*eXtreme Gradient Boosting*)
+
+A continuació posem en pràctica l'algorisme de *XGBoost* tot seguint
+l'exemple descrit en l'obra de P. Bruce, A. Bruce i P. Gedeck per
+treballara amb algorismes de *boosting* (BRUCE; BRUCE i GEDECK, 2022:
+263-265), tal i com proposàvem en les conclusions de la [segona
+part](https://rstudio-pubs-static.s3.amazonaws.com/1210635_de2722e2828045228bc539cedf4a5fb7.html#exercici-7),
+aplicant-hi el fluxe de treball per s'hi executin 500 models diferents
+amb diverses parametritzacions aleatòries, tot realitzent el fluxe
+automatitzat el control del resultat per sel·leccionar el model més
+óptim a més de realitzar també aquestes comprovacions amb diverses
+porcions d'entrenament del conjunt de dades, tot seguint el model
+proposa [T. Pham en *RPubs*](https://rpubs.com/pmtam/XGboost).
+Posteriorment, farem la classificació corresponent amb el conjunt de
+dades dels conductors accidentats dels qui desconeixem el motiu del seu
+desplaçament:
+
+```{r warning=FALSE, error=FALSE}
+data.xgb <- dadesSup[, c("Tipus_vehicle_estandaritzat",
+                       "Descripcio_causa_mediata", "Estacio_any",
+                       "Nom_mes", "Victimes_CODIF", "Vehicles_CODIF",
+                       "Edat_CODIF", "Es_laborable", "Es_ocupacional",
+                     "Es_mon_treball")]
+
+set.seed(123)
+cust_split <- data.xgb %>%
+  initial_split(prop = 0.8, strata = Es_mon_treball)
+
+train <- training(cust_split)
+test <- testing(cust_split)
+
+# Cross validation folds from training dataset
+set.seed(234)
+folds <- vfold_cv(train, strata = Es_mon_treball)
+
+cust_rec <- recipe(Es_mon_treball ~., data = train) %>%
+#  update_role(customerID, new_role = "ID") %>%
+#  step_corr(all_numeric()) %>%
+  step_corr(all_numeric(), threshold = 0.7, method = "spearman") %>%
+  step_zv(all_numeric()) %>% # filter zero variance
+  step_normalize(all_numeric()) %>%
+  step_dummy(all_nominal_predictors())
+
+```
+
+```{r include=FALSE}
+xgb_spec0 <- boost_tree() %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification") 
+
+xgb_wf0 <-
+ workflow() %>%
+ add_recipe(cust_rec) %>% 
+ add_model(xgb_spec0)
+
+xgb_fit0 <- fit_resamples(xgb_wf0,
+                         resamples = folds,
+                         metrics = metric_set(accuracy, roc_auc, sens,spec),
+                         control = control_resamples(save_pred = TRUE))
+
+xgb_final <- last_fit(
+  xgb_wf0,
+  split = cust_split,
+  metrics = metric_set(accuracy, roc_auc, sens,spec)
+)
+
+```
+
+```{r include=FALSE}
+xgb_final %>% 
+  collect_metrics()
+
+```
+
+```{r include=FALSE}
+xgb_final %>%
+  collect_predictions() %>%
+  conf_mat(Es_mon_treball,.pred_class)
+```
+
+```{r warning=FALSE}
+# Setup a model specification
+xgb_spec <-boost_tree(
+  trees = 500,
+  tree_depth = tune(), 
+  min_n = tune(),
+  loss_reduction = tune(),                    ## first three: model complexity
+  sample_size = tune(), mtry = tune(),        ## randomness
+  learn_rate = tune()                         ## step size
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_wf <- workflow() %>%
+  add_formula(Es_mon_treball ~.) %>%
+  add_model(xgb_spec)
+
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), train),
+  learn_rate(),
+  size = 20
+)
+
+doParallel::registerDoParallel()
+
+set.seed(234)
+xgb_res <-tune_grid(
+  xgb_wf,
+  resamples = folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred  = TRUE)
+)
+
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               names_to = "parameter",
+               values_to = "value") %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE)+
+  facet_wrap(~parameter, scales = "free_x")
+
+
+```
+
+```{r warning=FALSE}
+show_best(xgb_res)
+```
+
+```{r warnings=FALSE}
+best_auc <- select_best(xgb_res)
+final_xgb <- finalize_workflow(xgb_wf, best_auc)
+
+final_rs <- last_fit(final_xgb, cust_split,
+                     metrics = metric_set(accuracy, roc_auc, sens,spec))
+final_rs %>%
+  collect_metrics()
+```
+
+```{r}
+final_wf <- final_rs %>%
+  extract_workflow()
+
+desconegutsPred <- dadesDesconegutSup[, c("Tipus_vehicle_estandaritzat",
+                       "Descripcio_causa_mediata", "Estacio_any",
+                       "Nom_mes", "Victimes_CODIF", "Vehicles_CODIF",
+                       "Edat_CODIF", "Es_laborable", "Es_ocupacional")]
+
+prediction.xgb <- predict(final_wf, desconegutsPred)
+table(prediction.xgb)
+```
+
+Constatem que la precisió obtinguda és del 66% i la sensitivitat del
+69.9% supera l'especificitat. Per altra banda, a l'aplicar el model
+obtingut amb el conjunt de dades al que cerquem fer l'imputació,
+observem que és lleugerament superior el nombre d'observacions
+classificades com "Si" (1) que les del cas "No" (0). Atès que en
+l'anàlisi realitzat en la [segona
+part](https://rpubs.com/ramirezjm/1210635) ja vam observar l'elevada
+capacitat predictiva de la variable "Es_ocupacional" i que en el conjunt
+de dades de conductors dels qui es desconeix el motiu del seu
+desplaçament però l'accident sí va tenir lloc durant una franja horària
+ocupacional en dia laboral (v. Figura 1.2), considerem que aquest
+resultat té una fiabilitat bona i cal tenir en compte aquest resultat
+per la valoració final.
+
+## Arbre de decisió (*Decision tree*)
+
+A continuació, bastirem un model de classificació mitjançant l'algorisme
+de l'Arbre de decisió del módul C50 de R sense realitzar-ne cap poda ni
+cap canvi en els seu paràmetres per defecte:
+
+```{r include=FALSE}
+dummy <- dadesSup
+```
+
+En primer lloc, ho comprovarem incloent-hi també la variable "Nom_mes":
+
+```{r}
+dummy[] <- lapply(dummy, factor)
+colsExcloses <- c("VUP_CODIF", "VM2R_CODIF", "VM4R_CODIF", "V_no_permis_CODIF",
+                  "Interve_conductor_novell", "Nom_districte",
+                  "Descripcio_sexe", "Victimitzacio_est_", "Edat",
+                  "Es_mon_treball", "prediction", "Numero_morts",
+             "Numero_lesionats_lleus", "Numero_lesionats_greus",
+             "Numero_victimes", "Numero_vehicles_implicats",
+             "EMT_recodificat")
+
+y <- dummy$Es_mon_treball
+colsSup <- !colnames(dummy) %in% colsExcloses
+x <- dummy[colsSup]
+
+split_prop <- 5 
+indexes = sample(1:nrow(dummy),
+                 size=floor(((split_prop-1)/split_prop)*nrow(dummy)))
+train_x <- x[indexes, ]
+train_y <- y[indexes]
+test_x <- x[-indexes, ]
+test_y <- y[-indexes]
+```
+
+```{r, height=12}
+model1 <- C50::C5.0(train_x, train_y, rules=TRUE)
+summary(model1)
+
+model1 <- C50::C5.0(train_x, train_y)
+plot(model1, type="s", title="Fig. 4. Arbre de decisió sense podar.")
+
+```
+
+```{r}
+predicted_model1 <- predict(model1, test_x, type="class")
+
+print(sprintf("La precisió de l'arbre sense podar és del %.4f %%.",
+              100*sum(predicted_model1 == test_y) / length(predicted_model1)))
+
+mat_conf <- table(test_y, Predicted=predicted_model1); mat_conf
+
+# TN: mat_conf[1]
+# FP: mat_conf[2]
+# FN: mat_conf[3]
+# TP: mat_conf[4]
+
+# sensitivity
+sensitivitat <- mat_conf[4] / (mat_conf[4] + mat_conf[3])
+print(glue("\n\nLa sensitivitat de la predicció és {round(sensitivitat, 4)}."))
+
+# specifity
+especificitat <- mat_conf[1] / (mat_conf[1] + mat_conf[2])
+print(glue("\n\nL'especificitat de la predicció és {round(especificitat, 4)}."))
+```
+
+En aquest cas, amb l'arbre de decisió sense podar s'observa una notable
+millora en la seva intel·legibilitat en contrast als models d'arbre de
+decisió bastits en la [segona
+part](https://rstudio-pubs-static.s3.amazonaws.com/1210635_de2722e2828045228bc539cedf4a5fb7.html#exercici-5),
+constatant-se que el model primordialment fa servir les variables
+"Tipus_vehicle_estandarditzat" i "Es_ocupacional" per realitzar la
+classificació. Tot i així, constatem també que la tendència continua
+sent que la sensitivitat sigui inferior a l'especificitat.
+
+I ara realitzarem la prova sense incloure-la:
+
+```{r}
+
+train_x_ <- x[indexes, !colnames(x) %in% c("Nom_mes")]
+colnames(train_x)
+train_y <- y[indexes]
+test_x_ <- x[-indexes, !colnames(x) %in% c("Nom_mes")]
+test_y <- y[-indexes]
+
+model1 <- C50::C5.0(train_x_, train_y, rules=TRUE)
+summary(model1)
+
+model1 <- C50::C5.0(train_x_, train_y)
+plot(model1, type="s", title="Fig. 5. Arbre de decisió sense podar.")
+
+```
+
+```{r}
+predicted_model1 <- predict(model1, test_x, type="class")
+
+print(sprintf("La precisió de l'arbre sense podar és del %.4f %%.",
+              100*sum(predicted_model1 == test_y) / length(predicted_model1)))
+
+```
+
+```{r}
+mat_conf <- table(test_y, Predicted=predicted_model1); mat_conf
+```
+
+```{r}
+# TN: mat_conf[1]
+# FP: mat_conf[2]
+# FN: mat_conf[3]
+# TP: mat_conf[4]
+
+# sensitivity
+sensitivitat <- mat_conf[4] / (mat_conf[4] + mat_conf[3])
+print(glue("\n\nLa sensitivitat de la predicció és {round(sensitivitat, 4)}."))
+
+# specifity
+especificitat <- mat_conf[1] / (mat_conf[1] + mat_conf[2])
+print(glue("\n\nL'especificitat de la predicció és {round(especificitat, 4)}."))
+```
+
+```{r}
+predictions <- predict( model1, desconegutsPred, type="class" )
+
+table(predictions)
+```
+
+Per altra banda, observem que aproximadament sí segueix la proporció
+observable en l'anterior figura 1.2, tot i que la similitud del resultat
+ens suggereix també cert sobreajust en aquest model de classificació.
+
+ës necessari recordar que l'arbre de decisió aquí implementat presenta
+el defecte de la poca robustesa dels seus resultats. Com ja vam observar
+en l'anterior [segona part](https://rpubs.com/ramirezjm/1210635), aquest
+conjunt de dades presenta grups molt petits que, durant la creació del
+conjunt de dades d'entrenament, poden resultar resta especialment
+infrarrepresentats o inclús deixats de banda. Aquest fenomen pot
+comportar que els resultats obtinguts en una iteració resultin diferents
+als de la següent iteració i, per tant, la seva fiabilitat es torna
+otencialment qüestionable. I, finalment, constatem que, en el cas de
+l'arbre de decisió, atès a que l'algorisme prioritza l'ús òptim de les
+variables amb més capacitat explicativa com són les del tipus de vehicle
+i si l'accident va tenir lluc o no durant un horari ocupacional, no hi
+té cap efecte.
+
+## Arbre de decisió amb parametrització diferent
+
+Realitzarem a continuació el mateix arbre de decisió però forçant que
+realitzi fins 99 iteracions a fi que escolleixi les prediccions més
+òptimes en cadascuna:
+
+```{r}
+nTrials <-99
+
+model_nTrials <- C50::C5.0(train_x, train_y, trials = nTrials)
+
+predicted_modelnTrials <- predict(model_nTrials, test_x, type="class")
+
+print(sprintf("La precisió de l'arbre amb 99 iteracions és del %.4f %%.",
+              100*sum(predicted_modelnTrials == test_y) / length(predicted_modelnTrials)))
+
+mat_conf <- table(test_y, Predicted=predicted_modelnTrials); mat_conf
+
+# TN: mat_conf[1]
+# FP: mat_conf[2]
+# FN: mat_conf[3]
+# TP: mat_conf[4]
+
+# sensitivity
+sensitivitat <- mat_conf[4] / (mat_conf[4] + mat_conf[3])
+print(glue("\n\nLa sensitivitat de la predicció és {round(sensitivitat, 4)}."))
+
+# specifity
+especificitat <- mat_conf[1] / (mat_conf[1] + mat_conf[2])
+print(glue("\n\nL'especificitat de la predicció és {round(especificitat, 4)}."))
+
+```
+
+```{r}
+predictions <- predict(model_nTrials, desconegutsPred, type="class")
+
+table(predictions)
+
+```
+
+En aquest model s'observa una millora amb la precisió que va acompanyada
+també que l'indicador de la sensitivitat és també per sobre per sobre de
+l'especificitat. Per altra banda, al fer la classificació de les dades
+dels conductors dels qui es desconeix el motiu del desplaçament,
+observem que la majoria de resultats són negatius.
+
+## Bosc aleatori (*Random forest*)
+
+Tot seguit, també bastim un model de classificació del Bosc aleatoriq ue
+realitzarà 500 iteracions sobre el conjunt de dades d'entrenament:
+
+```{r}
+library(rpart)
+
+colsExcloses <- c("VUP_CODIF", "VM2R_CODIF", "VM4R_CODIF", "V_no_permis_CODIF",
+                  "Interve_conductor_novell", "Nom_districte",
+                  "Descripcio_sexe", "Victimitzacio_est_", "Edat",
+                  "Es_mon_treball", "prediction", "Numero_morts",
+             "Numero_lesionats_lleus", "Numero_lesionats_greus",
+             "Numero_victimes", "Numero_vehicles_implicats",
+             "EMT_recodificat")
+
+colsSup <- !colnames(dummy) %in% colsExcloses
+
+x <- dummy[colsSup]
+y <- dummy$Es_mon_treball
+
+rf <- randomForest(y ~., data = x); rf
+
+```
+
+```{r}
+mat_conf <- rf$confusion
+
+# sensitivity
+sensitivitat <- mat_conf[4] / (mat_conf[4] + mat_conf[3])
+print(glue("\n\nLa sensitivitat de la predicció és {round(sensitivitat, 4)}."))
+
+especificitat <- mat_conf[1] / (mat_conf[1] + mat_conf[2])
+print(glue("\n\nLa especificitat de la predicció és {round(especificitat, 4)}."))
+```
+
+```{r}
+predictions.rf <- predict( rf, desconegutsPred, type="class" )
+
+table(predictions.rf)
+```
+
+Es constata que el resultat del model és pitjor que l'anterior on havíem
+modificat la parametrització amb 99 iteracions atès a que la
+sensitivitat és inferior i l'especificitat ha augmentat, indicant-nos
+risc de sobreajust, tot i que també cal observar que el resultat de la
+predicció és molt similar al de les proporcions descrites en l'anterior
+Figura 1.2
+
+## Arbre de decisió podat (*Prune tree*)
+
+Finalment, també provarem amb el mètode de l'arbre podat que ja vam
+possar en pràctica en la segona part. en aquest cas, ens limitarem a
+bastir el model mitjançant la funció tree() del módul Rpart de tal
+manera que seleccioni les tres branques que dinin un resultat més òptim.
+
+```{r}
+dummy <- dadesSup
+
+dummy[] <- lapply(dummy, factor)
+colsExcloses <- c("VUP_CODIF", "VM2R_CODIF", "VM4R_CODIF", "V_no_permis_CODIF",
+                  "Interve_conductor_novell", "Nom_districte",
+                  "Descripcio_sexe", "Victimitzacio_est_", "Edat",
+                  "prediction", "Numero_morts",
+             "Numero_lesionats_lleus", "Numero_lesionats_greus",
+             "Numero_victimes", "Numero_vehicles_implicats",
+             "EMT_recodificat")
+
+
+colsSup <- !colnames(dummy) %in% colsExcloses
+dummy_ <- dummy[colsSup]
+
+split <- createDataPartition(y=dummy_$Es_mon_treball, p=4/5, list=FALSE)
+
+train <- dummy_[split,]
+test <- dummy_[-split,]
+
+trees <- tree(Es_mon_treball~., train)
+
+```
+
+```{r}
+prune.trees <- prune.tree(trees, best=3)
+
+```
+
+```{r}
+tree.pred <- predict(prune.trees, test, type='class')
+confusionMatrix(tree.pred, test$Es_mon_treball, positive = "Si")
+```
+
+```{r}
+prediction.prune.tree <- predict(prune.trees, desconegutsPred, type='class')
+table(prediction.prune.tree)
+```
+
+S'observa que en el cas del model de l'arbre podat els resultats són
+similars als del model bastit amb l'algorisme del Bosc aleatori, sent
+majoritària la classe negativa de la variable dependent "Es_mon_treball"
+al classificar el subconjunt de dades dels conductors dels qui es
+desconeix el motiu del seu desplaçament.
+
+# Elecció del model
+
+En primer lloc presentarem la Taula amb els resultats més rellevants
+d'aquesta tercera part per, a continuació, justificar l'elecció del
+resultat del model *XGBoost*.
+
+## Taula de resultats
+
+Només es detallaran els indicadors de precisió dels models de regressió
+logística, *XGBoost* i de l'arbre podat atès que en tots tres casos el
+model resultant és prou robust, es a dir, no mostra una variabilitat
+apreciable en els seus resultats.
+
++-------+-------------------+-------------------+-------------------+
+| Índex | Descripció del    | Tipus de dades    | R esultats        |
+|       | resultat          |                   |                   |
++=======+===================+===================+===================+
+| #1    | Total de          | Enter             | 5019              |
+|       | **conductors**    |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #2    | Subtotal de       | Enter, percentil  | 2823,             |
+|       | **conductors dels |                   |                   |
+|       | qui sí es coneix  |                   | 56.246 %          |
+|       | el motiu del seu  |                   |                   |
+|       | desplaçament**,   |                   |                   |
+|       | proporció sobre   |                   |                   |
+|       | el total          |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #3    | Nombre            | Enter             | 2561              |
+|       | d'accidents amb   |                   |                   |
+|       | **conductors dels |                   |                   |
+|       | qui sí es coneix  |                   |                   |
+|       | el motiu del seu  |                   |                   |
+|       | desplaçament**    |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #4    | Subtotal de       | Enter, percentil  | 2196,             |
+|       | **conductors dels |                   |                   |
+|       | qui no es coneix  |                   | 43.754 %          |
+|       | el motiu del seu  |                   |                   |
+|       | desplaçament**,   |                   |                   |
+|       | proporció sobre   |                   |                   |
+|       | el total          |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #5    | Nombre            | Enter             | 2029              |
+|       | d'accidents amb   |                   |                   |
+|       | **conductors dels |                   |                   |
+|       | qui no es coneix  |                   |                   |
+|       | el motiu del seu  |                   |                   |
+|       | desplaçament**    |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #6    | **Conductors      | Enter, percentil  | 1272,             |
+|       | accidenats en     |                   |                   |
+|       | horari            |                   | 45.058 %          |
+|       | ocupacional**,    |                   |                   |
+|       | proporció sobre   |                   |                   |
+|       | el total de       |                   |                   |
+|       | **conductors del  |                   |                   |
+|       | que sí es         |                   |                   |
+|       | coneixia el motiu |                   |                   |
+|       | del               |                   |                   |
+|       | desplaçament**    |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #7    | **Conductors      | Enter, percentil  | 1551,             |
+|       | accidenats en     |                   |                   |
+|       | horari no         |                   | 54.942 %          |
+|       | ocupacional**,    |                   |                   |
+|       | proporció sobre   |                   |                   |
+|       | el total de       |                   |                   |
+|       | **conductors del  |                   |                   |
+|       | que sí es         |                   |                   |
+|       | coneixia el motiu |                   |                   |
+|       | del               |                   |                   |
+|       | desplaçament**    |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #8    | **Conductors      | Enter, percentil  | 1150,             |
+|       | accidenats en     |                   |                   |
+|       | horari            |                   | 52.368 %          |
+|       | ocupacional**,    |                   |                   |
+|       | proporció sobre   |                   |                   |
+|       | el total de       |                   |                   |
+|       | **conductors del  |                   |                   |
+|       | que no es         |                   |                   |
+|       | coneixia el motiu |                   |                   |
+|       | del               |                   |                   |
+|       | desplaçament**    |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #9    | **Conductors      | Enter, percentil  | 1046,             |
+|       | accidenats en     |                   |                   |
+|       | horari no         |                   | 47.632 %          |
+|       | ocupacional**,    |                   |                   |
+|       | proporció sobre   |                   |                   |
+|       | el total de       |                   |                   |
+|       | **conductors del  |                   |                   |
+|       | que no es         |                   |                   |
+|       | coneixia el motiu |                   |                   |
+|       | del               |                   |                   |
+|       | desplaçament**    |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #10   | Nombre de         | Enter             | 23                |
+|       | **variables       |                   |                   |
+|       | independents      |                   |                   |
+|       | valorades** per   |                   |                   |
+|       | incloure en el    |                   |                   |
+|       | model de          |                   |                   |
+|       | classificació     |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #11   | Nombre de         | Enter             | 8                 |
+|       | **variables       |                   |                   |
+|       | independents      |                   |                   |
+|       | acceptades** per  |                   |                   |
+|       | incloure en el    |                   |                   |
+|       | model de          |                   |                   |
+|       | classificació     |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #12   | En el model de    | Booleà            | Fals              |
+|       | **Regressió       |                   |                   |
+|       | Logística**, la   |                   |                   |
+|       | Sensitivitat era  |                   |                   |
+|       | superior a        |                   |                   |
+|       | l'Especificitat   |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #13   | Precisió,         | Decimal, decimal, | 0.666, 0.6472,    |
+|       | Sensitivitat i    | decimal           | 0.6812            |
+|       | Especificitat del |                   |                   |
+|       | model **Regressió |                   |                   |
+|       | Logística**       |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #14   | En el model de    | Booleà            | Cert              |
+|       | **XGBoost**, la   |                   |                   |
+|       | Sensitivitat era  |                   |                   |
+|       | superior a        |                   |                   |
+|       | l'Especificitat   |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #15   | Precisió,         | Decimal, decimal, | 0.663, 0.699,     |
+|       | Sensitivitat i    | decimal           | 0.621             |
+|       | Especificitat del |                   |                   |
+|       | model **XGBoost** |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #16   | En el model       | Booleà            | Fals              |
+|       | d'**Arbre de      |                   |                   |
+|       | decisió sense     |                   |                   |
+|       | parametritzar**,  |                   |                   |
+|       | la Sensitivitat   |                   |                   |
+|       | era superior a    |                   |                   |
+|       | l'Especificitat   |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #17   | En el model       | Booleà            | Cert              |
+|       | d'**Arbre de      |                   |                   |
+|       | decisió           |                   |                   |
+|       | parametritzat**   |                   |                   |
+|       | per executar 99   |                   |                   |
+|       | cicles, la        |                   |                   |
+|       | Sensitivitat era  |                   |                   |
+|       | superior a        |                   |                   |
+|       | l'Especificitat   |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #18   | En el model del   | Booleà            | Fals              |
+|       | **Bosc            |                   |                   |
+|       | aleatori**, la    |                   |                   |
+|       | Sensitivitat era  |                   |                   |
+|       | superior a        |                   |                   |
+|       | l'Especificitat   |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #19   | En el model de    | Booleà            | Fals              |
+|       | l'**Arbre         |                   |                   |
+|       | podat**, la       |                   |                   |
+|       | Sensitivitat era  |                   |                   |
+|       | superior a        |                   |                   |
+|       | l'Especificitat   |                   |                   |
++-------+-------------------+-------------------+-------------------+
+| #20   | Precisió,         | Decimal, decimal, | 0.6649, 0.6274,   |
+|       | Sensitivitat i    | decimal           | 0.6977            |
+|       | Especificitat del |                   |                   |
+|       | model de          |                   |                   |
+|       | l'**Arbre podat** |                   |                   |
++-------+-------------------+-------------------+-------------------+
+
+## Justificació
+
+En aquesta tercera part d'aquesta tasca de classificació dels conductors
+ferits en accidents de trànsit durant l'any 2023, en certa mesura ens
+hem centrat a realitzar en la pràctica una imputació per aquells 2196
+conductors dels qui es desconeixia el motiu del seu desplaçament. La
+rellevància de realitzar aquesta imputació la trobem en el fet que
+aquests representaven fins el 43% del total de conductors feris i dels
+qui disposàvem d'un joc complet de dades vàlides (v. fila #3 en Taula de
+resultats). Una proporció tant elevada tornava com poc fiable la
+variable del *motiu dels desplaçament* pel seu anàlisi però, amb la
+tasca realitzada fins ara valorem que sí podria ser ja utilitzable com
+una variable més per enriquir l'estudi les tendències en els accidents
+de trànsit amb ferits en els que hi intervingueren agents de la Guàrdia
+Urbana de Barcelona.
+
+També cal valorar com rellevants les variables acceptades per la seva
+significància estadística per explicar el resultat que, en aquest cas,
+és indicar "Si"/"No" per cada conductor en relació a si el motiu del seu
+desplaçament en el moment de ser partícep en el corresponent accident
+documentat tenia relació amb el món del treball - v. detall del
+significat d'aquesta variable en la [primera
+part](https://rpubs.com/ramirezjm/1210633) d'aquest estudi-, no només
+per que l'agorisme corresponent el valori estadísticament òptim, si no
+també per que resulten coherents amb allò que coneixem del món del
+treball. Resulta congruent que el tipus de vehicle - especialment els
+vehicles d'ús professional- o el fet que l'accident tingui lloc durant
+un dia laborable i un horari ocupacional siguin rellevants si el
+desplaçament era per un motiu laboral. Per altra banda, ja de forma més
+intuïtiva també resulta coherent que hi siguin rellevants l'edat -
+significament, amb una codificació que limita l'efecte dels *outliers* o
+valors extrems- o en quin mes o estació de l'any va tenir lloc. I, desde
+una perspectiva analítica i per la seva posterior interpretació, resulta
+d'interès que el nombre de víctimes, el nombre de vehicles implicats i
+la causa mediata de l'accident també tinguin relacions relllevants., tot
+i que no s'ha d'entendre en cap cas com la seva causa.
+
+En relació al model de *XGBoost* de classificació finalment escollit, la
+classificació implementada resulta robusta pel fet que no deriva d'una
+sola partició de dades per obtenir el conjunt de dades d'entrenament o
+una aprametrització escollida a l'atzar, si no que és l'escollida per
+que és la que explica una major proporció de resultats de la variable
+dependent "Es_mon_treball" atès a l'indicador conegut com *Area under a
+curve* (AUC) després de realitzar-ne 500 proves diferents, tot cercant
+optimitzar successivament el darrer resultat en relació a l'anteriorment
+obtingut. i aplicant ponderació als grups de classes més reduït, tot
+reduïnt el biaix ja detectat en el conjunt de dades en la [segona
+part](https://rpubs.com/ramirezjm/1210635). Un tret que hi suma
+fiabilitat al resultat el trobem en el fet que és un dels pocs models de
+classificació que, al comprovar la classificació proposada, demostra
+també menys errors pel cas del resultat positiu - *Sí que el motiu del
+desplaçament està relacionat amb el món del treball*- és força inferior
+que el negatiu.
+
+```{r include=FALSE}
+colnames(dades_)
+dades__ <- dades_
+head(dades__)
+```
+
+```{r include=FALSE}
+dadesDesconegut_$Es_mon_treball <- unlist(prediction.xgb)
+dadesDesconegut__ <- dadesDesconegut_
+
+```
+
+```{r include=FALSE}
+final <- rbind(dades__, dadesDesconegut__)
+
+dadesWGS <- dadesAccidents[c("Numero_expedient", "Longitud_WGS84", "Latitud_WGS84")]
+final <- merge(x=final, y=dadesWGS, by="Numero_expedient")
+dades__ <- merge(x=dades__, y=dadesWGS, by="Numero_expedient")
+dadesDesconegut__ <- merge(x=dadesDesconegut__, y=dadesWGS, by="Numero_expedient")
+
+write.csv(dades__,
+          "C:/Sandbox/R/S02_Mineria_de_Dades/dadesMotiuConegutValids.csv", row.names=FALSE)
+write.csv(dadesDesconegut__,
+          "C:/Sandbox/R/S02_Mineria_de_Dades/dadesMotiuDesonegutValids.csv", row.names=FALSE)
+write.csv(final,
+          "C:/Sandbox/R/S02_Mineria_de_Dades/dadesTotsValids.csv", row.names=FALSE)
+```
+
+# Bibliografia
+
+-   **BRUCE, P.; BRUCE, A.; i GEDECK, P. 2022**. *Estadística práctica
+    para ciencia de datos con R y Python*, Barcelona: Marcombo.
+-   **INSTITUT METRÒPOLI. 2023**. *Enquesta de mobilitat en dia
+    feiner 2023. (EMEF 2023)*, Barcelona: Autoritat del Transport
+    Metropolità.
+    [URL](https://bcnroc.ajuntament.barcelona.cat/jspui/bitstream/11703/136649/2/EMEF%202023_Informe%20SIMMB%20ATM.pdf)
+    (darrera visita el 13-VIII-2024).
